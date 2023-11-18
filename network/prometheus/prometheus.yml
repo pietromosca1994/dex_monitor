@@ -1,0 +1,12 @@
+global:
+  scrape_interval: 1s
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: ['localhost:9090']
+  - job_name: 'dex_monitor'
+    static_configs:
+      - targets: ['host.docker.internal:8000']
+        labels:
+          instance: 'dex_monitor'
