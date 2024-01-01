@@ -13,6 +13,7 @@ import pandas as pd
 from typing import Union, List
 from utils import sqrtPriceX96_to_price, getContractAbi, getContractSourcecode
 import pprint
+import threading 
 
 from prometheus import update_pair
 
@@ -146,41 +147,20 @@ class UniSwapTrader(Uniswap, Trader):
         
         return pools
     
-    def monitorPool(self, address: str):
-        pool=LiquidityPool(web3=self.web3, address=address)
-        self.logger.info(pool)
+    def monitorPool(self, addresses: List[str]):
+        def event_handler(pool: LiquidityPool, event):
+            post_event=pool.postSwapEvent(event)
+            self.logger.info(f'Swap @ {pool.address}\n{pprint.pformat(dict(post_event), sort_dicts=False)}')
 
-        # callback for event found
-        def event_handler(event):
-            post_event=self.postSwapEvent(event)
-            self.logger.info(f'Swap @ {address}\n{pprint.pformat(dict(post_event), sort_dicts=False)}')
+        pools=[]
+        for address in addresses:
+            pools.append(UniswapLiquidityPool(web3=self.web3, address=address))
+            self.logger.info(pools[-1])
 
-        # listen to swap event
-        pool.listenEvent(event='Swap', 
-                         event_handler=event_handler, 
-                         from_block=self.web3.eth.block_number-5, 
-                         update_period=60)
-    
-    def postSwapEvent(self, event):
-        '''
-        Swap Event Format
-        https://docs.uniswap.org/contracts/v3/reference/core/interfaces/pool/IUniswapV3PoolEvents
-        Uniswap V3 Math
-        https://blog.uniswap.org/uniswap-v3-math-primer
-        '''
-        post_event={
-            'blockNumber': event['blockNumber'],
-            'event': event['event'],
-            'sender': event['args']['sender'],
-            'recipient': event['args']['recipient'],
-            'amount0': event['args']['amount0'],
-            'amount1': event['args']['amount1'],
-            'sqrtPrice': event['args']['sqrtPriceX96'],
-            'price': sqrtPriceX96_to_price(event['args']['sqrtPriceX96'], self.token0.decimals, ),
-            'tick': event['args']['tick'],
-            'deltaLiquidity': event['args']['liquidity']
-        }
-        return post_event
+        for pool in pools:
+            threading.Thread(target=pool.listenSwapEvent(event_handler=event_handler,
+                                                         from_block=self.web3.eth.block_number-5, 
+                                                         update_period=60)).start()
 
 class MyContract:
     def __init__(self, contract: Contract, verbose=logging.INFO):
@@ -209,7 +189,7 @@ class MyContract:
         events = self.contract.events[event].get_logs(fromBlock=from_block)
         for event in events:
             if event_handler:
-                event_handler(event)
+                event_handler(self, event)
 
 class Token(MyContract):
     def __init__(self, web3: Web3, address: str):
@@ -246,7 +226,37 @@ class LiquidityPool(MyContract):
 
     def __repr__(self) -> str:
         return str(self)
-        
+
+class UniswapLiquidityPool(LiquidityPool):
+    def __init__(self, web3: Web3, address: str):
+        super().__init__(web3, address)
+
+    def listenSwapEvent(self, event_handler=None, from_block: Union[int, str]='latest', update_period: int=60):
+        self.listenEvent(event='Swap', 
+                         event_handler=event_handler, 
+                         from_block=from_block, 
+                         update_period=update_period)
+
+    def postSwapEvent(self, event):
+        '''
+        Swap Event Format
+        https://docs.uniswap.org/contracts/v3/reference/core/interfaces/pool/IUniswapV3PoolEvents
+        Uniswap V3 Math
+        https://blog.uniswap.org/uniswap-v3-math-primer
+        '''
+        post_event={
+            'blockNumber': event['blockNumber'],
+            'event': event['event'],
+            'sender': event['args']['sender'],
+            'recipient': event['args']['recipient'],
+            'amount0': event['args']['amount0']/10**self.token0.decimals,
+            'amount1': event['args']['amount1']/10**self.token1.decimals,
+            'sqrtPriceX96': event['args']['sqrtPriceX96'],
+            'price': sqrtPriceX96_to_price(event['args']['sqrtPriceX96'], self.token0.decimals, self.token1.decimals),
+            'tick': event['args']['tick'],
+            'deltaLiquidity': event['args']['liquidity']
+        }
+        return post_event
 #%%
 # load environment variables 
 dotenv.load_dotenv(verbose=True, override=True)
@@ -259,7 +269,7 @@ infura_url=os.path.join(InfuraNetworks.ETHEREUM_MAINNET.value, 'v3', os.getenv("
 web3 = Web3(Web3.HTTPProvider(infura_url))  
 
 #%%
-# initilize uniswap trader
+# initialize uniswap trader
 uniswap_trader=UniSwapTrader(web3=web3, version=2, verbose=logging.INFO)
 
 # pools=uniswap_trader.getPoolAddresses(n_pairs=1000)
@@ -268,7 +278,7 @@ uniswap_trader=UniSwapTrader(web3=web3, version=2, verbose=logging.INFO)
 #     print(uniswap_trader.get_price(EthereumMainnetAddresses.ETH.value, EthereumMainnetAddresses.USDC.value))
 #     sleep(1)
 
-uniswap_trader.monitorPool(address=WETH_USDT_pool)
+uniswap_trader.monitorPool(addresses=[WETH_USDT_pool])
 
 #%% 
 # test liquidity pool
