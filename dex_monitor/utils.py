@@ -5,6 +5,10 @@ def sqrtPriceX96_to_price(sqrtPriceX96: int, token0_decimals:int, token1_decimal
     price = (sqrtPriceX96/2**96)**2*10**(token0_decimals-token1_decimals)
     return price
 
+def tick_to_price(tick: float, token0_decimals:int, token1_decimals: int, base: float=1.0001):
+    price = base ** tick **2*10**(token0_decimals-token1_decimals)
+    return price
+
 def getContractAbi(address: str):
     # Etherscan API URL
     api_url = f'https://api.etherscan.io/api'

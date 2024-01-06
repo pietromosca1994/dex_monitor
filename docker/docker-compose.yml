@@ -1,0 +1,65 @@
+version: '3.8'
+
+services:
+  prometheus:
+    image: prom/prometheus
+    container_name: prometheus
+    hostname: prometheus
+    domainname: prometheus.com
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus:/etc/prometheus
+      - /var/run/docker.sock:/var/run/docker.sock
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+    networks: 
+      - dex_network
+
+  grafana:
+    image: grafana/grafana
+    container_name: grafana
+    hostname: grafana
+    domainname: grafana.com
+    user: "0" 
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./grafana:/var/lib/grafana
+    depends_on:
+      - prometheus
+    networks: 
+      - dex_network
+
+  postgres:
+    image: postgres:latest
+    container_name: postgres
+    hostname: postgres
+    ports: 
+      - "5432:5432"
+    environment: 
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=${POSTGRES_DB}
+    volumes:
+      - ./postgres:/var/lib/postgresql/data
+    networks:
+      - dex_network
+
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: pg-admin
+    hostname: pg-admin
+    environment:
+      - PGADMIN_DEFAULT_EMAIL=${PGADMIN_DEFAULT_EMAIL}
+      - PGADMIN_DEFAULT_PASSWORD=${PGADMIN_DEFAULT_PASSWORD}
+    depends_on:
+      - postgres
+    ports:
+      - "5050:80"
+    networks:
+      - dex_network
+
+networks: 
+  dex_network:
+    name: dex_network

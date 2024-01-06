@@ -1,21 +1,27 @@
-#%%
-from uniswap import Uniswap
-from web3 import Web3, exceptions
-from web3.eth import Contract
-import dotenv
+import sys
 import os 
+PROJECT_PATH=os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+sys.path.insert(0, PROJECT_PATH)
+
+from web3 import Web3
+from uniswap import Uniswap
+import dotenv
 from enum import Enum
 import logging
 from prometheus_client import start_http_server
 from time import sleep 
 import json
 import pandas as pd
-from typing import Union, List
-from utils import sqrtPriceX96_to_price, getContractAbi, getContractSourcecode
-import pprint
+from typing import Union, List, Dict
 import threading 
+from sqlalchemy import create_engine
+from sqlalchemy.engine.base import Engine
+from copy import copy
 
-from prometheus import update_pair
+from dex_monitor.prometheus import update_pair
+from dex_monitor.tables import Base
+from dex_monitor.liquidity_pool import UniswapLiquidityPool, LiquidityPool
+from dex_monitor.event import Event
 
 WBTC_ETH_pool='0xCBCdF9626bC03E24f779434178A73a0B4bad62eD'
 WETH_USDC_pool='0x88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640'
@@ -43,15 +49,24 @@ class InfuraNetworks(Enum):
     POLYGON_MAINNET='https://polygon-mainnet.infura.io'
     POLYGON_MUMBAI='https://polygon-mumbai.infura.io'
 
+new_block_event=threading.Event()
+
+
 class Trader():
     def __init__(self,
                  address: str=None,
                  private_key: str=None,
                  web3: Web3=None,
+                 engine: Engine=None,
                  verbose: int=logging.INFO):
-        
         self.web3=web3
+        self.engine=engine
 
+        self.latest_block=self.web3.eth.block_number
+        self.pools: List[LiquidityPool]=[]
+
+        if self.engine:
+            Base.metadata.create_all(bind=self.engine)
         # configure logger
         logging.basicConfig(
             level=verbose,
@@ -64,32 +79,52 @@ class Trader():
         self.logger=logging.getLogger(self.__class__.__name__)
         pass 
 
-    def listenEvent(self, contract: Contract, event: Union[List[str], str], event_handler=None, from_block: Union[int, str]='latest', update_period: int=60):
-        self.logger.info(f'Listening for event {event} @ {contract.address}')
-
-        # subscribe to events
-        while True:
-            self.getEvent(contract, event, event_handler, from_block)
-            sleep(update_period)
+    def onNewBLock(self):
+        raise NotImplementedError
     
-    @staticmethod
-    def getEvent(contract: Contract, event: Union[List[str], str], event_handler=None, from_block: Union[int, str]='latest'):
-        events = contract.events[event].get_logs(fromBlock=from_block)
-        for event in events:
-            if event_handler:
-                event_handler(event)
+    def updateLatestBlock(self, update_period: int):
+        while True:
+            # get latest block
+            latest_block=self.web3.eth.block_number
+            
+            # check if there is a new block
+            if latest_block!=self.latest_block:
+                self.latest_block=latest_block
+                self.onNewBLock()
+            
+            sleep(update_period)
+
+    def monitor(self, update_period: int =1):
+        threading.Thread(self.updateLatestBlock(update_period))        
+
+
+    # def listenEvent(self, contract: Contract, event: Union[List[str], str], event_handler=None, from_block: Union[int, str]='latest', update_period: int=60):
+    #     self.logger.info(f'Listening for event {event} @ {contract.address}')
+
+    #     # subscribe to events
+    #     while True:
+    #         self.getEvent(contract, event, event_handler, from_block)
+    #         sleep(update_period)
+    
+    # @staticmethod
+    # def getEvent(contract: Contract, event: Union[List[str], str], event_handler=None, from_block: Union[int, str]='latest'):
+    #     events = contract.events[event].get_logs(fromBlock=from_block)
+    #     for event in events:
+    #         if event_handler:
+    #             event_handler(event)
     
 class UniSwapTrader(Uniswap, Trader):
     def __init__(self,
                  address: str=None,
                  private_key: str=None,
                  web3: Web3=None,
+                 engine: Engine=None,
                  version: int=1,
                  verbose=logging.INFO):
         
-        Trader.__init__(self, web3=web3, verbose=verbose)
+        Trader.__init__(self, web3=web3, engine=engine, verbose=verbose)
 
-        if web3.is_connected():
+        if self.web3.is_connected():
             Uniswap.__init__(self, 
                              address=address,
                              private_key=private_key,
@@ -99,12 +134,18 @@ class UniSwapTrader(Uniswap, Trader):
         else:
             self.logger.error(f"Web3 is currently not connected")
 
+    
     @update_pair
     def get_price(self, token_in, token_out):
         return self.get_raw_price(token_in, token_out)
     
-    # def get_event
-
+    def setPools(self, addresses: List[str]):
+        self.logger.info("Setting pools to monitor")
+        for address in addresses:
+            pool=UniswapLiquidityPool(web3=self.web3, address=address)
+            self.pools.append(copy(pool))
+            self.logger.info(pool)
+            
     def getPoolAddresses(self, n_pairs: int = None):
         with open('./dex_monitor/abi/uniswap_factory_v2.json', 'r') as f:
             abi=json.load(f)
@@ -147,120 +188,23 @@ class UniSwapTrader(Uniswap, Trader):
         
         return pools
     
-    def monitorPool(self, addresses: List[str]):
-        def event_handler(pool: LiquidityPool, event):
-            post_event=pool.postSwapEvent(event)
-            self.logger.info(f'Swap @ {pool.address}\n{pprint.pformat(dict(post_event), sort_dicts=False)}')
+    def onNewBLock(self):
+        for pool in self.pools:
+            threading.Thread(pool.getEvent(event='Swap',
+                                           from_block=self.latest_block,
+                                           to_block=self.latest_block,
+                                           callback=self.SwapEventCallback)) #TODO substitute with getSwapEvent
 
-        pools=[]
-        for address in addresses:
-            pools.append(UniswapLiquidityPool(web3=self.web3, address=address))
-            self.logger.info(pools[-1])
+    def SwapEventCallback(self, event: Event, pool: LiquidityPool):
+        # post_event=pool.postSwapEvent(event)
+        self.logger.info(f'Swap event @ {pool.address}\n{event}')
+        pool.logSwapEvent(self.engine, event)
+        pool.logStatus(self.engine, event)
 
-        for pool in pools:
-            threading.Thread(target=pool.listenSwapEvent(event_handler=event_handler,
-                                                         from_block=self.web3.eth.block_number-5, 
-                                                         update_period=60)).start()
-
-class MyContract:
-    def __init__(self, contract: Contract, verbose=logging.INFO):
-        self.contract=contract
-
-        # configure logger
-        logging.basicConfig(
-            level=verbose,
-            format="%(asctime)s [%(levelname)s] %(message)s",  # Define the log format
-            handlers=[
-                logging.StreamHandler(),  # Output logs to the console
-                # logging.FileHandler("app.log"),  # Output logs to a file (optional)
-            ]
-        )
-        self.logger=logging.getLogger(self.__class__.__name__)
-
-    def listenEvent(self, event: Union[List[str], str], event_handler=None, from_block: Union[int, str]='latest', update_period: int=60):
-        self.logger.info(f'Listening for event {event} @ {self.contract.address}')
-
-        # subscribe to events
-        while True:
-            self.getEvent(event, event_handler, from_block)
-            sleep(update_period)
-    
-    def getEvent(self, event: Union[List[str], str], event_handler=None, from_block: Union[int, str]='latest'):
-        events = self.contract.events[event].get_logs(fromBlock=from_block)
-        for event in events:
-            if event_handler:
-                event_handler(self, event)
-
-class Token(MyContract):
-    def __init__(self, web3: Web3, address: str):
-        self.web3=web3
-        self.address=Web3.to_checksum_address(address)
-        contract=self.web3.eth.contract(address=self.address, abi=getContractAbi(address))
-        super().__init__(contract)
-        self.decimals=self.contract.functions.decimals().call()
-        self.symbol=self.contract.functions.symbol().call()
-
-    def __str__(self):
-        string=f"{self.symbol} @ {self.address}"
-        return string
-
-    def __repr__(self) -> str:
-        return str(self)
-        
-class LiquidityPool(MyContract):
-    def __init__(self, web3: Web3, address: str):
-        self.address=Web3.to_checksum_address(address)
-        self.web3=web3
-        contract=self.web3.eth.contract(address=self.address, abi=str(getContractAbi(address)))
-        super().__init__(contract)
-        token0_address=self.contract.functions.token0().call()
-        token1_address=self.contract.functions.token1().call()
-        self.token0=Token(web3=self.web3, address=token0_address)
-        self.token1=Token(web3=self.web3, address=token1_address)
-
-    def __str__(self)->str:
-        string=f"Liquidity Pool @ {self.address}\n \
-                token0: {self.token0}\n \
-                token1: {self.token1}\n"
-        return string
-
-    def __repr__(self) -> str:
-        return str(self)
-
-class UniswapLiquidityPool(LiquidityPool):
-    def __init__(self, web3: Web3, address: str):
-        super().__init__(web3, address)
-
-    def listenSwapEvent(self, event_handler=None, from_block: Union[int, str]='latest', update_period: int=60):
-        self.listenEvent(event='Swap', 
-                         event_handler=event_handler, 
-                         from_block=from_block, 
-                         update_period=update_period)
-
-    def postSwapEvent(self, event):
-        '''
-        Swap Event Format
-        https://docs.uniswap.org/contracts/v3/reference/core/interfaces/pool/IUniswapV3PoolEvents
-        Uniswap V3 Math
-        https://blog.uniswap.org/uniswap-v3-math-primer
-        '''
-        post_event={
-            'blockNumber': event['blockNumber'],
-            'event': event['event'],
-            'sender': event['args']['sender'],
-            'recipient': event['args']['recipient'],
-            'amount0': event['args']['amount0']/10**self.token0.decimals,
-            'amount1': event['args']['amount1']/10**self.token1.decimals,
-            'sqrtPriceX96': event['args']['sqrtPriceX96'],
-            'price': sqrtPriceX96_to_price(event['args']['sqrtPriceX96'], self.token0.decimals, self.token1.decimals),
-            'tick': event['args']['tick'],
-            'deltaLiquidity': event['args']['liquidity']
-        }
-        return post_event
 #%%
 # load environment variables 
-dotenv.load_dotenv(verbose=True, override=True)
-
+dotenv.load_dotenv('./.env', verbose=True, override=True)
+dotenv.load_dotenv('./docker/.env', verbose=True, override=True)
 # start 
 # start_http_server(8000)
 
@@ -268,23 +212,12 @@ dotenv.load_dotenv(verbose=True, override=True)
 infura_url=os.path.join(InfuraNetworks.ETHEREUM_MAINNET.value, 'v3', os.getenv("INFURA_API_KEY"))
 web3 = Web3(Web3.HTTPProvider(infura_url))  
 
+# initialize engine
+database_url=f"postgresql://{os.getenv('POSTGRES_USER')}:{os.getenv('POSTGRES_PASSWORD')}@localhost:5432/dex_db"
+engine=create_engine(database_url, echo=False)  
+
 #%%
 # initialize uniswap trader
-uniswap_trader=UniSwapTrader(web3=web3, version=2, verbose=logging.INFO)
-
-# pools=uniswap_trader.getPoolAddresses(n_pairs=1000)
-
-# while True: 
-#     print(uniswap_trader.get_price(EthereumMainnetAddresses.ETH.value, EthereumMainnetAddresses.USDC.value))
-#     sleep(1)
-
-uniswap_trader.monitorPool(addresses=[WETH_USDT_pool])
-
-#%% 
-# test liquidity pool
-pool=LiquidityPool(web3=web3, address=WETH_USDT_pool)
-
-
-# %%
-code=getContractSourcecode(WETH_USDT_pool)
-# %%
+uniswap_trader=UniSwapTrader(web3=web3, engine=engine, version=2, verbose=logging.INFO)
+uniswap_trader.setPools(addresses=[WETH_USDT_pool])
+uniswap_trader.monitor(update_period=1)
